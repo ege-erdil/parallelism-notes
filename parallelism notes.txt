@@ -1,0 +1,73 @@
+definitions
+
+DP: data parallelism
+EP: expert parallelism
+PP: pipeline parallelism
+TP: tensor parallelism
+
+one transformer block consists of the following ops, assuming num_heads * d_query = d_model:
+
+(seq_length, d_model, batch_size) * (d_model, d_model, batch_size, 3) -> (seq_length, d_model, batch_size, 3)		(compute QKV)				parameter count: 3d^2
+(seq_length, d_model, batch_size) * (d_model, seq_length, batch_size) -> (seq_length, seq_length, batch_size)		(compute softmax(Q^T K))		parameter count: N/A
+(seq_length, seq_length, batch_size) * (seq_length, d_model, batch_size) -> (seq_length, d_model, batch_size)		(multiply by V)				parameter count: N/A
+(seq_length, d_model, batch_size) * (d_model, d_model, batch_size) -> (seq_length, d_model, batch_size)			(combine attention heads)		parameter count: d^2
+
+(seq_length, d_model, batch_size) x (d_model, k d_model) -> (seq_length, k d_model, batch_size)				(feedforward step 1)			parameter count: k*d^2
+(seq_length, k d_model, batch_size) x (k d_model, d_model) -> (seq_length, d_model, batch_size)				(feedforward step 2)			parameter count: k*d^2
+
+
+total memory read & writes for feedforward: (kd^2 + bsd + kbsd) + (kd^2 + kbsd + bsd)
+total multiplications for feedforward: b*ksd^2
+
+memops per multiplication operation = 1/(bs) + 1/d * (k+1)/k
+
+with naive 4D parallelism, 1D tensor:
+
+(DP*PP*EP)/(bs) + TP/d * (k+1)/k
+
+with 2D tensor:
+
+(DP*PP*EP)/(bs) + sqrt(TP)/d * (k+1)/k
+
+
+
+memory reads per operation must be at most 1/1000 for good utilization -> bs/(DP*PP*EP) > 1000, d/(sqrt(TP)) > 1000 (assuming k large - a typical choice is k = 4 so (k+1)/k = 5/4 is a negligible factor)
+
+critical batch size b*s is ~ 4M * EP tokens (plausible but not supported by solid evidence). typical d ~ 10K, plugging in:
+
+(4M * EP)/(DP*PP*EP) > 1000, 10K/(sqrt(TP)) > 1000
+
+DP*PP < 4M/1K = 4K
+
+sqrt(TP) < 10, TP < 100
+
+model size for a dense model: (4 + 2k) d^2 * (number of layers), with k = 4 -> around 10Ld^2. sanity check: chinchilla 70B used L = 80 and d = 8192, so the rough formula predicts ~ 53B parameters, which is roughly equal to 70B
+chinchilla optimal model training cost scales with the hidden dimension to the fourth power! rough approximation: N*D ~ 20*N^2 = 20 * (10Ld^2)^2 = 2e3 * L^2 * d^4 ops
+
+conclusion: scaling TP might not be feasible past some point. increasing d_model raises usable TP quadratically, but required chinchilla-optimal training compute quartically
+however, we're currently far away from limits: d_model = 10K can feasibly scale up to TP = 100, more than an OOM from where we are right now
+
+as a result, for a dense model (EP = 1), current technology might only permit the use of TP_max * (DP * PP)_max = 100 * 4K = 400K GPUs at high utilization just because of arithmetic intensity constraints, aside from inter-GPU bandwidth issues
+if using 1D tensor parallelism (only slice weight matrices into rows, not rows & columns simultaneously), this is cut down to ~ 40K GPUs only
+
+key uncertainty is about EP: is it true that critical batch size scales linearly with EP? if so, will increasing training compute by scaling EP/sparsity be as effective as scaling a dense model? intelligent use of sparsity might become critical & important algorithmic advantage of top labs over laggards
+
+
+
+**bandwidth limits to TP***
+
+
+inter-GPU bandwidth limits to TP: in general, naive TP entails moving O(d_model) parameters in an all-to-all fashion per GPU per layer per input token processed per forward pass, and the constant C_TP in the big O can be substantial, e.g. more than 10
+
+so the total amount of information movement cost of processing B tokens is ~ C_TP*L*d*B*TP*p per forward pass, where TP is the number of ways we're tensor parallel and p is the number of bytes per parameter, i.e. the precision in bytes
+
+at the same time, the FLOP cost of a forward pass is roughly 2*(number of params) = (approx.) 20*L*B*d^2
+
+so the bytes moved to FLOP ratio that we need is ~ (C_TP*TP*p)/(20*d). for C_TP = 20, p = 1 byte, d = 10K this gives TP/(10K) bytes per FLOP, or equivalently (bytes/s)/(FLOP/s)
+
+suppose we have a cluster with N_GPU GPUs having a performance of X in units of FLOP/s/GPU. then, the total amount of bandwidth we need for decent utilization is N_GPU*X*TP/(10K FLOP/byte), and the all-to-all bandwidth we need in tensor parallel nodes per GPU is X*TP/(10K FLOP/byte). for instance, if we use A100s with X = 3e14 FLOP/s and want 8-way tensor parallelism, we need at least 240 GB/s of within-node all-to-all bandwidth per GPU. note that the bandwidth we need for a certain amount of TP is *independent* of PP, DP and EP: it's just a function of X, C_TP, TP and d_model.
+
+the linear scaling of required bandwidth with TP can be improved if more clever tensor parallelism schemes are used, e.g. by making the constant C_TP slightly worse at the expense of making required bandwidth scale with sqrt(TP) instead of TP by using 2D tensor parallelism. such methods can help further relax the bottlenecks here in general, but likely haven't been used so far as they didn't permit increasing TP past 8 (the NVLink maximum node size) in the pre-H100 interconnect technology environment. so we see that inter-GPU communication has indeed historically been a bottleneck on tensor parallelism, which agrees with the empirical observation that people don't scale TP past 8 when training models with A100s.
+
+
+
