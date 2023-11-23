@@ -57,7 +57,7 @@ key uncertainty is about EP: is it true that critical batch size scales linearly
 **bandwidth limits to TP***
 
 
-inter-GPU bandwidth limits to TP: in general, naive TP entails moving O(d_model) parameters in an all-to-all fashion per GPU per layer per input token processed per forward pass, and the constant C_TP in the big O can be substantial, e.g. more than 10
+inter-GPU bandwidth limits to TP: in general, naive TP entails moving O(d_model) parameters in an all-to-all fashion per tensor parallel GPU per layer per input token processed per forward pass, and the constant C_TP in the big O can be substantial, e.g. more than 10
 
 so the total amount of information movement cost of processing B tokens is ~ C_TP*L*d*B*TP*p per forward pass, where TP is the number of ways we're tensor parallel and p is the number of bytes per parameter, i.e. the precision in bytes
 
@@ -67,7 +67,6 @@ so the bytes moved to FLOP ratio that we need is ~ (C_TP*TP*p)/(20*d). for C_TP 
 
 suppose we have a cluster with N_GPU GPUs having a performance of X in units of FLOP/s/GPU. then, the total amount of bandwidth we need for decent utilization is N_GPU*X*TP/(10K FLOP/byte), and the all-to-all bandwidth we need in tensor parallel nodes per GPU is X*TP/(10K FLOP/byte). for instance, if we use A100s with X = 3e14 FLOP/s and want 8-way tensor parallelism, we need at least 240 GB/s of within-node all-to-all bandwidth per GPU. note that the bandwidth we need for a certain amount of TP is *independent* of PP, DP and EP: it's just a function of X, C_TP, TP and d_model.
 
+here is another (equivalent) way to think of the above calculation: in naive TP, each tensor parallel GPU has to receive a hidden state vector of size p*d_model C_TP/(PP*DP*EP) times (on average) per layer per forward pass per token (we divide by EP*DP because each forward pass uses a fraction 1/(EP*DP) of our GPUs, and we divide by PP because more pipeline parallelism means more GPUs are involved in a forward pass -> we get the same total bandwidth with smaller per GPU bandwidth), so each tensor parallel GPU needs to read C_TP*L*d*B*p/(PP*DP*EP) bytes per forward pass. this means the same calculation as before now gives us (C_TP*p)/(20*d*PP*DP*EP) = (TP/N_GPU) * (C_TP*p)/(20*d) bytes a tensor-parallel GPU has to read per FLOP (N_GPU is the total number of GPUs in our cluster, so N_GPU = EP*PP*DP*TP). since all of our GPUs are in some tensor-parallel node, it follows that the total amount of information movement is (C_TP*TP*p)/(20*d), which is the same as the result from the previous calculation. 
+
 the linear scaling of required bandwidth with TP can be improved if more clever tensor parallelism schemes are used, e.g. by making the constant C_TP slightly worse at the expense of making required bandwidth scale with sqrt(TP) instead of TP by using 2D tensor parallelism. such methods can help further relax the bottlenecks here in general, but likely haven't been used so far as they didn't permit increasing TP past 8 (the NVLink maximum node size) in the pre-H100 interconnect technology environment. so we see that inter-GPU communication has indeed historically been a bottleneck on tensor parallelism, which agrees with the empirical observation that people don't scale TP past 8 when training models with A100s.
-
-
-
