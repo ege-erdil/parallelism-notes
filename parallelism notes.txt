@@ -17,21 +17,19 @@ one transformer block consists of the following ops, assuming num_heads * d_quer
 
 
 total memory read & writes for feedforward: (kd^2 + bsd + kbsd) + (kd^2 + kbsd + bsd)
-total multiplications for feedforward: b*ksd^2
+total multiplications for feedforward: 2b*ksd^2
 
 memops per multiplication operation = 1/(bs) + 1/d * (k+1)/k
 
 with naive 4D parallelism, 1D tensor:
 
-(DP*PP*EP)/(bs) + TP/d * (k+1)/k
+(kd^2/TP + bsd/(PP*DP*EP) + kbsd/(TP*PP*EP*DP))/(b*ksd^2/(TP*PP*EP*DP)) = DP*PP*EP/(bs) + TP/(k*d) + 1/d
 
 with 2D tensor:
 
-(DP*PP*EP)/(bs) + sqrt(TP)/d * (k+1)/k
+(kd^2/TP + bsd/(sqrt(TP/k)*PP*DP*EP) + kbsd/(sqrt(TP*k)*PP*EP*DP))/(b*ksd^2/(TP*PP*EP*DP)) = DP*PP*EP/(bs) + 2*sqrt(TP/k)/d
 
-
-
-memory reads per operation must be at most 1/1000 for good utilization -> bs/(DP*PP*EP) > 1000, d/(sqrt(TP)) > 1000 (assuming k large - a typical choice is k = 4 so (k+1)/k = 5/4 is a negligible factor)
+memory reads per operation must be at most 1/1000 for good utilization -> bs/(DP*PP*EP) > 1000, d/(sqrt(TP)) > 1000 (assuming k = 4)
 
 critical batch size b*s is ~ 4M * EP tokens (plausible but not supported by solid evidence). typical d ~ 10K, plugging in:
 
